@@ -64,8 +64,8 @@ const error = ref(null)
 const uploadedImage = ref(null)
 const analysis = ref('')
 
-const API_URL = 'http://localhost:3000/api'
-
+// const API_URL = 'http://localhost:3000/api'
+const API_URL = 'http://10.121.9.26:3000/api'
 const handleFileSelect = (event) => {
   const file = event.target.files[0]
   if (file) {

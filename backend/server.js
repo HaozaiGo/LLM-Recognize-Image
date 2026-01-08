@@ -9,13 +9,15 @@ const axios = require("axios");
 const sharp = require("sharp");
 const { HttpProxyAgent } = require("http-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
+const { Ollama } = require('ollama')
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Enable CORS for frontend
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, "uploads");
@@ -89,6 +91,14 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
     let analysis = null;
     let processed = false;
     let processingError = null;
+    const recognitionType = req.body.type || 'printer';
+    
+    const getPrompt = (type) => {
+      if (type === 'medicine') {
+        return '请分析这张图片中的药品信息。请告诉我图片中显示的药品名称以及该药品的功效介绍。请以JSON格式返回答案，包含"medicine_name"和"efficacy"两个键。';
+      }
+      return '请分析这张图片中的打印机信息。请告诉我图片中显示的是什么型号的打印机以及这台打印机使用的纸张尺寸。请以JSON格式返回答案，包含"printer_model"和"paper_size"两个键。';
+    };
 
     // Use OpenAI Vision API if configured, otherwise try DeepSeek
     if (process.env.OPENAI_API_KEY) {
@@ -125,7 +135,7 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
                     content: [
                       {
                         type: "text",
-                        text: '请分析这张图片中的打印机信息。请告诉我图片中显示的是什么型号的打印机以及这台打印机使用的纸张尺寸。请以JSON格式返回答案，包含"printer_model"和"paper_size"两个键。',
+                        text: getPrompt(recognitionType),
                       },
                       {
                         type: "image_url",
@@ -241,7 +251,7 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
             messages: [
               {
                 role: "user",
-                content: `请分析这张图片中的打印机信息。图片是base64编码的JPEG格式。请告诉我图片中显示的是什么型号的打印机以及这台打印机使用的纸张尺寸。请以JSON格式返回答案，包含"printer_model"和"paper_size"两个键。\n\n图片base64数据: data:image/jpeg;base64,${finalImageBase64}`,
+                content: `${getPrompt(recognitionType)}\n\n图片base64数据: data:image/jpeg;base64,${finalImageBase64}`,
               },
             ],
             max_tokens: 2000,
@@ -394,6 +404,39 @@ app.post("/api/chat", async (req, res) => {
     res.status(statusCode).json({
       error: error.message || "Failed to get chat completion",
       details: error.error || error.response?.data || null,
+    });
+  }
+});
+
+// Ollama chat endpoint
+app.post("/api/ollama/chat", async (req, res) => {
+  try {
+    const { message, image, model = "gemma3" } = req.body;
+    if (!message && !image) {
+      return res.status(400).json({ error: "Message or image is required" });
+    }
+
+    const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434";
+    const ollamaClient = new Ollama({ host: ollamaUrl });
+
+    const requestBody = {
+      model: model,
+      messages: [
+        {
+          role: "user",
+          content: message || "请分析这张图片",
+          ...(image && { images: [image] }),
+        },
+      ],
+    };
+    
+    const response = await ollamaClient.chat(requestBody);
+    res.json({ content: response.message?.content || response.response });
+  } catch (error) {
+    console.error("Ollama chat error:", error);
+    res.status(500).json({
+      error: error.message || "Failed to get ollama response",
+      details: error.response?.data || null,
     });
   }
 });
