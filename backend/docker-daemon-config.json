@@ -1,0 +1,9 @@
+{
+  "proxies": {
+    "http-proxy": "http://host.docker.internal:7890",
+    "https-proxy": "http://host.docker.internal:7890",
+    "no-proxy": "localhost,127.0.0.1"
+  },
+  "registry-mirrors": []
+}
+

@@ -1,0 +1,10 @@
+node_modules
+uploads
+.git
+.env
+*.log
+npm-debug.log*
+pnpm-lock.yaml
+package-lock.json
+
+

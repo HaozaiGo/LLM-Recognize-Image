@@ -19,7 +19,8 @@ const API_URL_ENV = process.env.EXPO_PUBLIC_API_URL;
 // 此时你需要：
 // - 方案1: 不使用 tunnel，确保手机和电脑在同一 WiFi 网络（推荐用于开发）
 // - 方案2: 为后端创建隧道（如使用 ngrok: ngrok http 3000），然后使用隧道地址
-const DEV_API_URL = 'http://10.121.9.26:3000/api';
+const DEV_API_URL = 'http://10.122.27.49:3000/api';
+
 
 // 生产环境 API URL
 const PROD_API_URL = 'https://your-backend-domain.com/api';

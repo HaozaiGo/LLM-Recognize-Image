@@ -9,7 +9,23 @@ const axios = require("axios");
 const sharp = require("sharp");
 const { HttpProxyAgent } = require("http-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
-const { Ollama } = require('ollama')
+const { Ollama } = require('ollama');
+
+let undiciDispatcher = null;
+try {
+  const undici = require('undici');
+  const timeout = parseInt(process.env.OLLAMA_TIMEOUT || "1800000");
+  undiciDispatcher = new undici.Agent({
+    headersTimeout: timeout,
+    bodyTimeout: timeout,
+    connectTimeout: 10000,
+  });
+  undici.setGlobalDispatcher(undiciDispatcher);
+  console.log(`Undici dispatcher configured with timeout: ${timeout}ms`);
+} catch (e) {
+  console.warn('Failed to set undici dispatcher:', e.message);
+  console.warn('Undici not available, using default fetch timeout');
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,6 +77,21 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: fileFilter,
+});
+
+const audioUpload = multer({
+  storage: multer.diskStorage({
+    destination: function (req, file, cb) {
+      cb(null, uploadsDir);
+    },
+    filename: function (req, file, cb) {
+      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+      cb(null, "audio-" + uniqueSuffix + path.extname(file.originalname));
+    },
+  }),
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB limit for audio
+  },
 });
 
 // Serve uploaded images statically
@@ -117,15 +148,18 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
         const imageBase64 = resizedImageBuffer.toString("base64");
 
         // Use OpenAI Vision API for actual image analysis
-        const openai = new OpenAI({
-          apiKey: process.env.OPENAI_API_KEY,
-          httpAgent: new HttpsProxyAgent("http://127.0.0.1:7890"), // Clash 默认端口
-        });
-        // Retry logic for connection errors
         let lastError = null;
-        const maxRetries = 3;
+        const maxRetries = process.env.PROXY_URL ? 2 : 3;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
           try {
+            const openaiConfig = {
+              apiKey: process.env.OPENAI_API_KEY,
+            };
+            if (process.env.PROXY_URL && attempt === 1) {
+              openaiConfig.httpAgent = new HttpsProxyAgent(process.env.PROXY_URL);
+            }
+            const openai = new OpenAI(openaiConfig);
+            
             const completion = await openai.chat.completions.create(
               {
                 model: process.env.OPENAI_VISION_MODEL || "gpt-4o", // or "gpt-4-vision-preview" or "gpt-4o-mini"
@@ -166,18 +200,26 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
               retryError.message
             );
 
-            // If it's a connection error and not the last attempt, wait and retry
-            if (
-              attempt < maxRetries &&
-              (retryError.message.includes("Connection error") ||
-                retryError.message.includes("ECONNREFUSED") ||
-                retryError.message.includes("ETIMEDOUT") ||
-                retryError.code === "ECONNREFUSED" ||
-                retryError.code === "ETIMEDOUT")
-            ) {
-              const waitTime = attempt * 2000; // Exponential backoff: 2s, 4s, 6s
-              console.log(`Retrying in ${waitTime}ms...`);
-              await new Promise((resolve) => setTimeout(resolve, waitTime));
+            const isConnectionError = 
+              retryError.message?.includes("Connection error") ||
+              retryError.message?.includes("ECONNREFUSED") ||
+              retryError.message?.includes("ETIMEDOUT") ||
+              retryError.message?.includes("ECONNRESET") ||
+              retryError.code === "ECONNREFUSED" ||
+              retryError.code === "ETIMEDOUT" ||
+              retryError.code === "ECONNRESET" ||
+              retryError.cause?.code === "ECONNREFUSED" ||
+              retryError.cause?.code === "ECONNRESET";
+
+            // If it's a connection error and not the last attempt
+            if (attempt < maxRetries && isConnectionError) {
+              if (process.env.PROXY_URL && attempt === 1) {
+                console.log(`Proxy connection failed, retrying without proxy...`);
+              } else {
+                const waitTime = attempt * 2000; // Exponential backoff: 2s, 4s, 6s
+                console.log(`Retrying in ${waitTime}ms...`);
+                await new Promise((resolve) => setTimeout(resolve, waitTime));
+              }
             } else {
               // Not a connection error or last attempt, throw immediately
               throw retryError;
@@ -196,28 +238,38 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
         );
         console.error("Full error:", error);
 
-        // Provide more helpful error messages
-        if (
-          error.message.includes("Connection error") ||
-          error.code === "ECONNREFUSED"
-        ) {
-          processingError =
-            "无法连接到OpenAI API。请检查网络连接或配置OPENAI_BASE_URL。";
-        } else if (error.message.includes("401") || error.status === 401) {
-          processingError = "OpenAI API密钥无效。请检查OPENAI_API_KEY配置。";
-        } else if (error.message.includes("429") || error.status === 429) {
-          processingError = "OpenAI API请求频率过高，请稍后重试。";
+        const isQuotaError = error.message.includes("429") || error.status === 429 || error.message.includes("quota");
+        
+        if (isQuotaError && process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_BASE_URL) {
+          console.log("OpenAI quota exceeded, falling back to DeepSeek...");
         } else {
-          processingError =
-            error.message || "Failed to process image with OpenAI Vision API";
+          if (
+            error.message.includes("Connection error") ||
+            error.code === "ECONNREFUSED"
+          ) {
+            processingError =
+              "无法连接到OpenAI API。请检查网络连接或配置OPENAI_BASE_URL。";
+          } else if (error.message.includes("401") || error.status === 401) {
+            processingError = "OpenAI API密钥无效。请检查OPENAI_API_KEY配置。";
+          } else if (isQuotaError) {
+            processingError = "OpenAI API配额已超限，请稍后重试。";
+          } else {
+            processingError =
+              error.message || "Failed to process image with OpenAI Vision API";
+          }
+          processed = false;
         }
-        processed = false;
       }
-    } else if (process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_BASE_URL) {
+    }
+    
+    if (!processed && process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_BASE_URL) {
       // Fallback to DeepSeek (note: DeepSeek doesn't support vision, so results will be inaccurate)
       try {
         const imagePath = req.file.path;
-
+        const openai = new OpenAI({
+          baseURL: 'https://api.deepseek.com',
+          apiKey: process.env.DEEPSEEK_API_KEY,
+        });
         // Resize and compress image to reduce token count
         const resizedImageBuffer = await sharp(imagePath)
           .resize(1024, 1024, {
@@ -244,8 +296,7 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
         }
 
         // DeepSeek API: Note - this won't actually analyze the image, just the text
-        const response = await axios.post(
-          `${process.env.DEEPSEEK_BASE_URL}/chat/completions`,
+        const response = await openai.chat.completions.create(
           {
             model: "deepseek-chat",
             messages: [
@@ -254,17 +305,11 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
                 content: `${getPrompt(recognitionType)}\n\n图片base64数据: data:image/jpeg;base64,${finalImageBase64}`,
               },
             ],
-            max_tokens: 2000,
           },
-          {
-            headers: {
-              Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-              "Content-Type": "application/json",
-            },
-          }
         );
 
-        analysis = response.data.choices[0].message.content;
+        analysis = response.choices[0].message.content;
+        console.log(analysis, '--------------------------------');
         processed = true;
         console.log(
           `Image ${req.file.filename} processed with DeepSeek (note: may be inaccurate)`
@@ -322,10 +367,13 @@ app.get("/api/images", (req, res) => {
 });
 app.post("/api/test", async (req, res) => {
   try {
-    const client = new OpenAI({
+    const openaiConfig = {
       apiKey: process.env.OPENAI_API_KEY,
-      httpAgent: new HttpsProxyAgent("http://127.0.0.1:7890"), // Clash 默认端口
-    });
+    };
+    if (process.env.PROXY_URL) {
+      openaiConfig.httpAgent = new HttpsProxyAgent(process.env.PROXY_URL);
+    }
+    const client = new OpenAI(openaiConfig);
     async function test() {
       const res = await client.models.list();
       return res.data;
@@ -408,6 +456,144 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+// Ollama connection test endpoint
+app.get("/api/ollama/test", async (req, res) => {
+  try {
+    const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434";
+    const url = new URL(ollamaUrl);
+    const host = `${url.hostname}${url.port ? `:${url.port}` : ''}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const response = await fetch(`${url.protocol}//${host}/api/tags`, {
+      method: 'GET',
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
+    
+    if (response.ok) {
+      const data = await response.json();
+      res.json({ 
+        success: true, 
+        message: "Ollama 连接成功",
+        url: ollamaUrl,
+        models: data.models || []
+      });
+    } else {
+      res.status(response.status).json({ 
+        success: false, 
+        message: `Ollama 响应错误: ${response.status}`,
+        url: ollamaUrl
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      message: error.message,
+      code: error.code,
+      url: process.env.OLLAMA_URL || "http://localhost:11434"
+    });
+  }
+});
+
+// Speech to text endpoint
+app.post("/api/speech-to-text", async (req, res) => {
+  let tempFilePath = null;
+  try {
+    console.log(req.body, '--------------------------------');
+    if (req.body.audio) {
+      const audioBuffer = Buffer.from(req.body.audio, "base64");
+      const format = req.body.format || "m4a";
+      tempFilePath = path.join(uploadsDir, `audio-${Date.now()}.${format}`);
+      fs.writeFileSync(tempFilePath, audioBuffer);
+    } else if (req.file) {
+      tempFilePath = req.file.path;
+    } else {
+      return res.status(400).json({ error: "No audio data provided" });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      if (tempFilePath && fs.existsSync(tempFilePath)) {
+        fs.unlinkSync(tempFilePath);
+      }
+      return res.status(500).json({ error: "OpenAI API key not configured" });
+    }
+
+    let openai;
+    let lastError = null;
+    const maxRetries = 2;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const openaiConfig = {
+          apiKey: process.env.OPENAI_API_KEY,
+        };
+        if (process.env.PROXY_URL && attempt === 1) {
+          openaiConfig.httpAgent = new HttpsProxyAgent(process.env.PROXY_URL);
+        }
+        openai = new OpenAI(openaiConfig);
+
+        const transcription = await openai.audio.transcriptions.create(
+          {
+            file: fs.createReadStream(tempFilePath),
+            model: "whisper-1",
+            language: "zh",
+          },
+          {
+            timeout: 60000,
+          }
+        );
+
+        if (tempFilePath && fs.existsSync(tempFilePath)) {
+          fs.unlinkSync(tempFilePath);
+        }
+
+        return res.json({ text: transcription.text });
+      } catch (retryError) {
+        lastError = retryError;
+        const isConnectionError = 
+          retryError.message?.includes("Connection error") ||
+          retryError.message?.includes("ECONNREFUSED") ||
+          retryError.message?.includes("ETIMEDOUT") ||
+          retryError.message?.includes("ECONNRESET") ||
+          retryError.code === "ECONNREFUSED" ||
+          retryError.code === "ETIMEDOUT" ||
+          retryError.code === "ECONNRESET" ||
+          retryError.cause?.code === "ECONNREFUSED" ||
+          retryError.cause?.code === "ECONNRESET";
+        
+        if (attempt < maxRetries && isConnectionError) {
+          if (process.env.PROXY_URL && attempt === 1) {
+            console.log(`Proxy connection failed, retrying without proxy...`);
+          } else {
+            console.log(`Connection failed, retrying...`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          continue;
+        }
+        throw retryError;
+      }
+    }
+
+  } catch (error) {
+    console.error("Speech to text error:", error);
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+    }
+    
+    let errorMessage = "Failed to transcribe audio";
+    if (error.message?.includes("Connection error") || 
+        error.cause?.code === "ECONNREFUSED" || 
+        error.cause?.code === "ECONNRESET") {
+      errorMessage = "无法连接到 OpenAI API。请检查网络连接或代理设置。";
+    } else if (error.message) {
+      errorMessage = error.message;
+    }
+    
+    res.status(500).json({ 
+      error: errorMessage 
+    });
+  }
+});
+
 // Ollama chat endpoint
 app.post("/api/ollama/chat", async (req, res) => {
   try {
@@ -417,7 +603,28 @@ app.post("/api/ollama/chat", async (req, res) => {
     }
 
     const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434";
-    const ollamaClient = new Ollama({ host: ollamaUrl });
+    const url = new URL(ollamaUrl);
+    const host = `${url.hostname}${url.port ? `:${url.port}` : ''}`;
+    const timeout = parseInt(process.env.OLLAMA_TIMEOUT || "1800000");
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    const ollamaClient = new Ollama({ 
+      host: host,
+      fetch: async (url, options) => {
+        const fetchOptions = {
+          ...options,
+          signal: controller.signal,
+          headers: {
+            ...options?.headers,
+            'Connection': 'keep-alive',
+          },
+        };
+        if (undiciDispatcher) {
+          fetchOptions.dispatcher = undiciDispatcher;
+        }
+        return fetch(url, fetchOptions).finally(() => clearTimeout(timeoutId));
+      }
+    });
 
     const requestBody = {
       model: model,
@@ -434,8 +641,17 @@ app.post("/api/ollama/chat", async (req, res) => {
     res.json({ content: response.message?.content || response.response });
   } catch (error) {
     console.error("Ollama chat error:", error);
+    console.error("Ollama URL:", process.env.OLLAMA_URL || "http://localhost:11434");
+    
+    let errorMessage = error.message || "Failed to get ollama response";
+    if (error.code === "ECONNREFUSED" || error.message?.includes("fetch failed") || error.message?.includes("ECONNREFUSED")) {
+      errorMessage = "无法连接到 Ollama 服务。请确保 Ollama 正在运行，或检查 OLLAMA_URL 配置。";
+    } else if (error.code === "UND_ERR_HEADERS_TIMEOUT" || error.message?.includes("Headers Timeout") || error.message?.includes("timeout")) {
+      errorMessage = "Ollama 服务响应超时。请检查 Ollama 服务状态或增加 OLLAMA_TIMEOUT 配置。";
+    }
+    
     res.status(500).json({
-      error: error.message || "Failed to get ollama response",
+      error: errorMessage,
       details: error.response?.data || null,
     });
   }
@@ -453,6 +669,10 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: error.message || "Internal server error" });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server is running on http://0.0.0.0:${PORT}`);
 });
+
+server.timeout = parseInt(process.env.SERVER_TIMEOUT || "1800000");
+server.keepAliveTimeout = 65000;
+server.headersTimeout = parseInt(process.env.SERVER_TIMEOUT || "1800000");

@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "./index.js",
   "scripts": {
-    "start": "expo start --clear",
+    "start": "expo start --lan --clear",
     "dev": "expo start --tunnel --clear",
     "android": "expo start --android --clear",
     "ios": "expo start --ios --clear",
@@ -15,6 +15,7 @@
     "@react-navigation/native": "^7.0.15",
     "axios": "^1.6.0",
     "expo": "~54.0.0",
+    "expo-av": "~16.0.8",
     "expo-clipboard": "~8.0.8",
     "expo-image-picker": "~17.0.10",
     "ollama": "^0.6.3",

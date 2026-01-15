@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   View,
   Text,
@@ -13,7 +13,8 @@ import {
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
-import axios from "axios";
+import { Audio } from "expo-av";
+import axiosInstance from "../../utils/axios";
 import { API_URL } from "../../config";
 
 export default function GeneralTab() {
@@ -21,6 +22,9 @@ export default function GeneralTab() {
   const [messages, setMessages] = useState([]);
   const [selectedImage, setSelectedImage] = useState(null);
   const [sending, setSending] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const recognitionRef = useRef(null);
+  const recordingRef = useRef(null);
 
   const pickImage = async () => {
     if (Platform.OS !== "web") {
@@ -68,6 +72,117 @@ export default function GeneralTab() {
     }
   };
 
+  useEffect(() => {
+    if (Platform.OS === "web" && "webkitSpeechRecognition" in window) {
+      const SpeechRecognition = window.webkitSpeechRecognition || window.SpeechRecognition;
+      recognitionRef.current = new SpeechRecognition();
+      recognitionRef.current.continuous = true;
+      recognitionRef.current.interimResults = false;
+      recognitionRef.current.lang = "zh-CN";
+      
+      recognitionRef.current.onresult = (event) => {
+        const transcript = Array.from(event.results)
+          .map((result) => result[0].transcript)
+          .join("");
+        setMessage((prev) => prev + transcript);
+      };
+      
+      recognitionRef.current.onerror = (event) => {
+        console.error("Speech recognition error:", event.error);
+        setRecording(false);
+      };
+      
+      recognitionRef.current.onend = () => {
+        setRecording(false);
+      };
+    }
+    
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+      if (recordingRef.current) {
+        recordingRef.current.stopAndUnloadAsync();
+      }
+    };
+  }, []);
+
+  const startVoiceInput = async () => {
+    if (Platform.OS === "web") {
+      if (recognitionRef.current && !recording) {
+        try {
+          recognitionRef.current.start();
+          setRecording(true);
+        } catch (error) {
+          Alert.alert("Error", "Speech recognition not available");
+        }
+      }
+    } else {
+      try {
+        const { status } = await Audio.requestPermissionsAsync();
+        if (status !== "granted") {
+          Alert.alert("Permission needed", "Please grant microphone permissions");
+          return;
+        }
+        
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+        
+        const { recording: newRecording } = await Audio.Recording.createAsync(
+          Audio.RecordingOptionsPresets.HIGH_QUALITY
+        );
+        recordingRef.current = newRecording;
+        setRecording(true);
+      } catch (error) {
+        console.error("Failed to start recording:", error);
+        Alert.alert("Error", "Failed to start recording");
+      }
+    }
+  };
+
+  const stopVoiceInput = async () => {
+    if (Platform.OS === "web") {
+      if (recognitionRef.current && recording) {
+        recognitionRef.current.stop();
+        setRecording(false);
+      }
+    } else {
+      if (recordingRef.current) {
+        const currentRecording = recordingRef.current;
+        recordingRef.current = null;
+        setRecording(false);
+        
+        try {
+          const status = await currentRecording.getStatusAsync();
+          if (status.isRecording) {
+            await currentRecording.stopAndUnloadAsync();
+          }
+          const uri = currentRecording.getURI();
+          
+          if (uri) {
+            const base64Audio = await FileSystem.readAsStringAsync(uri, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+            
+            const response = await axiosInstance.post("/speech-to-text", {
+              audio: base64Audio,
+              format: "m4a",
+            });
+            
+            if (response.data.text) {
+              setMessage((prev) => prev + response.data.text);
+            }
+          }
+        } catch (error) {
+          console.error("Error processing audio:", error);
+          Alert.alert("Error", error.response?.data?.error || "Failed to process audio");
+        }
+      }
+    }
+  };
+
   const handleSend = async () => {
     if (!message.trim() && !selectedImage) return;
 
@@ -81,7 +196,7 @@ export default function GeneralTab() {
         base64Image = await imageToBase64(currentImage);
       }
 
-      const response = await axios.post(`${API_URL}/ollama/chat`, {
+      const response = await axiosInstance.post("/ollama/chat", {
         message: userMessage,
         image: base64Image,
         model: "gemma3",
@@ -136,6 +251,12 @@ export default function GeneralTab() {
           value={message}
           onChangeText={setMessage}
         />
+        <TouchableOpacity
+          style={[styles.voiceButton, recording && styles.voiceButtonActive]}
+          onPress={recording ? stopVoiceInput : startVoiceInput}
+        >
+          <Text style={styles.voiceButtonText}>{recording ? "●" : "🎤"}</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={styles.addButton} onPress={pickImage}>
           <Text style={styles.addButtonText}>+</Text>
         </TouchableOpacity>
@@ -230,6 +351,22 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: "#333",
     marginRight: 8,
+  },
+  voiceButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#e0e0e0",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+  },
+  voiceButtonActive: {
+    backgroundColor: "#ff4444",
+  },
+  voiceButtonText: {
+    fontSize: 16,
+    color: "#333",
   },
   addButton: {
     width: 32,

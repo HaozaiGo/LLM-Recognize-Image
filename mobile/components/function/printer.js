@@ -90,7 +90,7 @@ export default function PrinterTab() {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
-        timeout: 10000,
+        timeout: 600000,
       });
 
       setUploadedImage(response.data.file);

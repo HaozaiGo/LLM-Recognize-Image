@@ -22,7 +22,8 @@
     "http-proxy-agent": "^7.0.0",
     "https-proxy-agent": "^7.0.0",
     "socks-proxy-agent": "^8.0.2",
-    "ollama": "^0.6.3"
+    "ollama": "^0.6.3",
+    "undici": "^6.19.8"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
