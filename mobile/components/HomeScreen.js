@@ -6,7 +6,7 @@ export default function HomeScreen() {
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" />
-      <Text style={styles.title}>Image Upload</Text>
+      <Text style={styles.title}>LLM Project</Text>
       <ImageUpload />
     </View>
   );

@@ -10,6 +10,11 @@ const sharp = require("sharp");
 const { HttpProxyAgent } = require("http-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const { Ollama } = require('ollama');
+const mysql = require('mysql2/promise');
+const { ChatOpenAI } = require('@langchain/openai');
+const { SqlDatabase } = require('langchain/sql_db');
+const { SqlDatabaseChain } = require('langchain/chains/sql_db');
+const { DataSource } = require('typeorm');
 
 let undiciDispatcher = null;
 try {
@@ -77,21 +82,6 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: fileFilter,
-});
-
-const audioUpload = multer({
-  storage: multer.diskStorage({
-    destination: function (req, file, cb) {
-      cb(null, uploadsDir);
-    },
-    filename: function (req, file, cb) {
-      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-      cb(null, "audio-" + uniqueSuffix + path.extname(file.originalname));
-    },
-  }),
-  limits: {
-    fileSize: 25 * 1024 * 1024, // 25MB limit for audio
-  },
 });
 
 // Serve uploaded images statically
@@ -498,7 +488,6 @@ app.get("/api/ollama/test", async (req, res) => {
 app.post("/api/speech-to-text", async (req, res) => {
   let tempFilePath = null;
   try {
-    console.log(req.body, '--------------------------------');
     if (req.body.audio) {
       const audioBuffer = Buffer.from(req.body.audio, "base64");
       const format = req.body.format || "m4a";
@@ -590,6 +579,110 @@ app.post("/api/speech-to-text", async (req, res) => {
     
     res.status(500).json({ 
       error: errorMessage 
+    });
+  }
+});
+
+// Query users with langchain endpoint
+app.post("/api/query-users", async (req, res) => {
+  let datasource = null;
+  try {
+    const { query } = req.body;
+    if (!query) {
+      return res.status(400).json({ error: "Query is required" });
+    }
+
+    const dbConfig = {
+      host: process.env.MYSQL_HOST || 'localhost',
+      port: process.env.MYSQL_PORT || 3306,
+      user: process.env.MYSQL_USER || 'root',
+      password: process.env.MYSQL_PASSWORD || 'rootpassword',
+      database: process.env.MYSQL_DATABASE || 'mydatabase',
+    };
+
+    datasource = new DataSource({
+      type: 'mysql',
+      host: dbConfig.host,
+      port: dbConfig.port,
+      username: dbConfig.user,
+      password: dbConfig.password,
+      database: dbConfig.database,
+      synchronize: false,
+      logging: false,
+      entities: [],
+    });
+
+    await datasource.initialize();
+    console.log('DataSource initialized');
+    console.log('Connected to database:', dbConfig.database);
+
+    const connection = datasource.driver.connection;
+    
+    const databases = await connection.query('SHOW DATABASES');
+    console.log('Available databases:', databases.map(d => Object.values(d)[0]));
+    
+    const tables = await connection.query('SHOW TABLES');
+    console.log('Database tables:', tables);
+
+    const db = await SqlDatabase.fromDataSourceParams({
+      appDataSource: datasource,
+      sampleRowsInTableInfo: 3,
+    });
+    console.log('SqlDatabase created');
+    
+    const dbTables = db.allTables.map(t => t.tableName);
+    console.log('SqlDatabase available tables:', dbTables);
+
+    const llm = new ChatOpenAI({
+      openAIApiKey: process.env.OPENAI_API_KEY,
+      modelName: 'gpt-3.5-turbo',
+      temperature: 0,
+      timeout: 30000,
+      maxRetries: 2,
+    });
+
+    const chain = new SqlDatabaseChain({
+      llm,
+      database: db,
+      verbose: true,
+    });
+    console.log('Chain created, starting query:', query);
+
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => {
+        console.error('Query timeout after 60 seconds');
+        reject(new Error('Query timeout after 60 seconds'));
+      }, 60000);
+    });
+
+    console.log('Calling chain.run...');
+    
+    try {
+      const result = await Promise.race([
+        chain.run(query),
+        timeoutPromise
+      ]);
+
+      console.log('Query result received:', result);
+      console.log('Result type:', typeof result);
+      console.log('Result length:', result?.length);
+      
+      await datasource.destroy();
+      console.log('DataSource destroyed');
+      
+      res.json({ result });
+    } catch (chainError) {
+      console.error('Chain run error:', chainError);
+      await datasource.destroy();
+      throw chainError;
+    }
+  } catch (error) {
+    console.error("Query users error:", error);
+    if (datasource && datasource.isInitialized) {
+      await datasource.destroy();
+    }
+    res.status(500).json({
+      error: error.message || "Failed to query users",
     });
   }
 });

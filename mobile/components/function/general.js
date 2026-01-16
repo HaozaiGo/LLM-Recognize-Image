@@ -23,6 +23,7 @@ export default function GeneralTab() {
   const [selectedImage, setSelectedImage] = useState(null);
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [isVoiceInput, setIsVoiceInput] = useState(false);
   const recognitionRef = useRef(null);
   const recordingRef = useRef(null);
 
@@ -85,6 +86,7 @@ export default function GeneralTab() {
           .map((result) => result[0].transcript)
           .join("");
         setMessage((prev) => prev + transcript);
+        setIsVoiceInput(true);
       };
       
       recognitionRef.current.onerror = (event) => {
@@ -173,6 +175,7 @@ export default function GeneralTab() {
             
             if (response.data.text) {
               setMessage((prev) => prev + response.data.text);
+              setIsVoiceInput(true);
             }
           }
         } catch (error) {
@@ -189,24 +192,38 @@ export default function GeneralTab() {
     setSending(true);
     const userMessage = message.trim() || "请分析这张图片";
     const currentImage = selectedImage;
+    const voiceInput = isVoiceInput;
+    // setIsVoiceInput(false);
     
     try {
-      let base64Image = null;
-      if (currentImage) {
-        base64Image = await imageToBase64(currentImage);
+      if (voiceInput) {
+        const response = await axiosInstance.post("/query-users", {
+          query: userMessage,
+        });
+
+        setMessages([
+          ...messages,
+          { type: "user", content: userMessage, image: currentImage },
+          { type: "assistant", content: response.data.result },
+        ]);
+      } else {
+        let base64Image = null;
+        if (currentImage) {
+          base64Image = await imageToBase64(currentImage);
+        }
+
+        const response = await axiosInstance.post("/ollama/chat", {
+          message: userMessage,
+          image: base64Image,
+          model: "gemma3",
+        });
+
+        setMessages([
+          ...messages,
+          { type: "user", content: userMessage, image: currentImage },
+          { type: "assistant", content: response.data.content },
+        ]);
       }
-
-      const response = await axiosInstance.post("/ollama/chat", {
-        message: userMessage,
-        image: base64Image,
-        model: "gemma3",
-      });
-
-      setMessages([
-        ...messages,
-        { type: "user", content: userMessage, image: currentImage },
-        { type: "assistant", content: response.data.content },
-      ]);
       setMessage("");
       setSelectedImage(null);
     } catch (error) {
@@ -249,7 +266,10 @@ export default function GeneralTab() {
           placeholder="Send a message"
           placeholderTextColor="#999"
           value={message}
-          onChangeText={setMessage}
+          onChangeText={(text) => {
+            setMessage(text);
+            // setIsVoiceInput(false);
+          }}
         />
         <TouchableOpacity
           style={[styles.voiceButton, recording && styles.voiceButtonActive]}
@@ -262,7 +282,10 @@ export default function GeneralTab() {
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.sendButton}
-          onPress={handleSend}
+          onPress={() => {
+            // setIsVoiceInput(false);
+            handleSend();
+          }}
           disabled={sending}
         >
           {sending ? (
